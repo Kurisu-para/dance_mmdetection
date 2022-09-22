@@ -61,6 +61,28 @@ def dice_loss(pred,
     loss = weight_reduce_loss(loss, weight, reduction, avg_factor)
     return loss
 
+def dice_ignore_loss(pred,
+              target,
+              weight=None,
+              eps=1e-3,
+              reduction='mean',
+              naive_dice=False,
+              avg_factor=None):
+    a = pred * target
+    b = pred * pred
+    c = target * target
+    b = torch.sum(b, (3, 2, 1))
+    c = torch.sum(c, (3, 2, 1))
+    a = torch.sum(a, (3, 2, 1))
+
+    dice_coef = (2 * a) / (b + c + eps)
+    loss = (1.0 - dice_coef).sum()
+    loss /= target.size(0)
+    if weight is not None:
+        assert weight.ndim == loss.ndim
+        assert len(weight) == len(pred)
+    loss = weight_reduce_loss(loss, weight, reduction, avg_factor)
+    return loss
 
 @LOSSES.register_module()
 class DiceLoss(nn.Module):
@@ -135,6 +157,101 @@ class DiceLoss(nn.Module):
                 raise NotImplementedError
 
         loss = self.loss_weight * dice_loss(
+            pred,
+            target,
+            weight,
+            eps=self.eps,
+            reduction=reduction,
+            naive_dice=self.naive_dice,
+            avg_factor=avg_factor)
+
+        return loss
+
+@LOSSES.register_module()
+class DiceIgnoreLoss(nn.Module):
+
+    def __init__(self,
+                 use_sigmoid=True,
+                 activate=True,
+                 reduction='mean',
+                 naive_dice=False,
+                 loss_weight=1.0,
+                 ignore_value=255,
+                 eps=1e-3):
+        """Compute dice loss.
+
+        Args:
+            use_sigmoid (bool, optional): Whether to the prediction is
+                used for sigmoid or softmax. Defaults to True.
+            activate (bool): Whether to activate the predictions inside,
+                this will disable the inside sigmoid operation.
+                Defaults to True.
+            reduction (str, optional): The method used
+                to reduce the loss. Options are "none",
+                "mean" and "sum". Defaults to 'mean'.
+            naive_dice (bool, optional): If false, use the dice
+                loss defined in the V-Net paper, otherwise, use the
+                naive dice loss in which the power of the number in the
+                denominator is the first power instead of the second
+                power. Defaults to False.
+            loss_weight (float, optional): Weight of loss. Defaults to 1.0.
+            eps (float): Avoid dividing by zero. Defaults to 1e-3.
+        """
+
+        super(DiceIgnoreLoss, self).__init__()
+        self.use_sigmoid = use_sigmoid
+        self.reduction = reduction
+        self.naive_dice = naive_dice
+        self.loss_weight = loss_weight
+        self.ignore_value = ignore_value
+        self.eps = eps
+        self.activate = activate
+
+    def forward(self,
+                pred,
+                target,
+                weight=None,
+                reduction_override=None,
+                avg_factor=None):
+        """Forward function.
+
+        Args:
+            pred (torch.Tensor): The prediction, has a shape (n, *).
+            target (torch.Tensor): The label of the prediction,
+                shape (n, *), same shape of pred.
+            weight (torch.Tensor, optional): The weight of loss for each
+                prediction, has a shape (n,). Defaults to None.
+            avg_factor (int, optional): Average factor that is used to average
+                the loss. Defaults to None.
+            reduction_override (str, optional): The reduction method used to
+                override the original reduction method of the loss.
+                Options are "none", "mean" and "sum".
+
+        Returns:
+            torch.Tensor: The calculated loss
+        """
+
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+
+        if len(target.size()) == 3:
+            target = target.unsqueeze(1)
+        assert pred.size() == target.size()
+
+        if self.activate:
+            if self.use_sigmoid:
+                pred = pred.sigmoid()
+            else:
+                raise NotImplementedError
+        
+        if self.ignore_value:
+            mask = torch.ne(target, self.ignore_value).float()
+            pred = pred * mask
+            target = target.float()
+            target = target * mask
+
+        loss = self.loss_weight * dice_ignore_loss(
             pred,
             target,
             weight,

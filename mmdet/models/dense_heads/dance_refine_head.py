@@ -8,13 +8,13 @@ from mmcv.cnn import ConvModule
 from typing import List, Union, Tuple
 import pycocotools.mask as mask_util
 
-from mmdet.core import InstanceData, mask_matrix_nms, multi_apply
+from mmdet.core import InstanceData, mask_matrix_nms, multi_apply, BitmapMasks, PolygonMasks
 from mmdet.core.utils import center_of_mass, generate_coordinate
 from mmdet.models.builder import HEADS, build_loss
 from .base_mask_head import BaseMaskHead
 from mmcv.runner import force_fp32
 
-from core.layers import extreme_utils
+from .core.layers import extreme_utils
 from shapely.geometry import Polygon
 
 class PolygonPoints:
@@ -214,6 +214,8 @@ def get_aux_extreme_points(pts):
 
     return re_ordered_pts, ext_idxs
 
+#In fact, batch size is only set as 1 in test, so
+#get_
 def get_polygon_rles(polygons, image_shape):
     # input: N x (p*2)
     polygons = polygons.cpu().numpy()
@@ -221,7 +223,9 @@ def get_polygon_rles(polygons, image_shape):
     rles = [
         mask_util.merge(mask_util.frPyObjects([p.tolist()], h, w)) for p in polygons
     ]
-    return rles
+    bitmap_masks = [mask_util.decode(rle).astype(np.bool)
+                    for rle in rles]
+    return bitmap_masks
 
 class DilatedCircularConv(nn.Module):
     def __init__(self, state_dim, out_state_dim=None, n_adj=4, dilation=1):
@@ -273,7 +277,7 @@ class _SnakeNet(nn.Module):
         # why +2?
         self.feature_dim = feature_dim + 2   #256+2
 
-        self.head = SnakeBlock(feature_dim, state_dim)
+        self.head = SnakeBlock(self.feature_dim, self.state_dim)
 
         self.res_layer_num = 7   #(8 - 1) * 3
         dilation = [1, 1, 1, 2, 2, 4, 4]   #(1, 1, 1, 2, 2, 4, 4) * 3
@@ -327,10 +331,10 @@ class _SnakeNet(nn.Module):
 class RefineHead(BaseMaskHead):
     def __init__(
         self,
-        #num_classes,
+        num_classes,
         in_channels,
         state_dim = 128,
-        feature_channels = 256,
+        feat_channels = 256,
         strides=(8, 16, 32, 64),
         num_iter = (0, 0, 1),
         num_convs = 2,
@@ -339,20 +343,23 @@ class RefineHead(BaseMaskHead):
         common_stride=4,
         loss_refine=dict(
                     type='SmoothL1Loss', loss_weight=10.0),
-        loss_edge=dict(type='DiceLoss', use_sigmoid = True, loss_weight=1.0),
+        loss_edge=dict(type='DiceIgnoreLoss', use_sigmoid = True, loss_weight=1.0),
         norm_cfg=dict(type='GN', num_groups=32, requires_grad=True),
         train_cfg=None,
         test_cfg=None,
-        init_cfg=None,
+        init_cfg=[dict(type='Kaiming', layer='Conv2d'),
+                  dict(type='Normal', layer='Conv1d', std=0.01,
+                        override=[dict(type='Normal', name='snake_conv', std=0.01),
+                                  dict(type='Normal', name='conv_att', std=0.01)])]
     ):
         super(RefineHead, self).__init__(init_cfg)
         self.common_stride = common_stride
         self.in_features = in_features
-        #self.num_classes = num_classes
+        self.num_classes = num_classes
         #self.cls_out_channels = self.num_classes
         self.in_channels = in_channels   #256
         self.state_dim = state_dim   #128
-        self.feature_channels = feature_channels   #256
+        self.feat_channels = feat_channels   #256
         self.strides = strides
         self.num_iter = num_iter   #(0, 0, 1)  correspond to the convs
         self.num_convs = num_convs   #2
@@ -379,11 +386,12 @@ class RefineHead(BaseMaskHead):
     
     def _init_snake_convs(self):
         self.snake_conv = nn.ModuleList()
+        #snake_conv == bottom_out
         for i in range(self.num_convs):
             self.snake_conv.append(
                 ConvModule(
-                    self.feature_channels,
-                    self.feature_channels,
+                    self.feat_channels,
+                    self.feat_channels,
                     kernel_size=3,
                     stride=1,
                     padding=1,
@@ -397,18 +405,18 @@ class RefineHead(BaseMaskHead):
         # snakes
         for i in range(len(self.num_iter)):
             #self.conv_type == "ccn"
-            snake_deformer = _SnakeNet(self.state_dim, self.feature_channels)   
+            snake_deformer = _SnakeNet(self.state_dim, self.feat_channels)   
             self.__setattr__("deformer" + str(i), snake_deformer)
 
         #initialization
-        for m in self.modules():
-            if (
-                isinstance(m, nn.Conv2d)
-                or isinstance(m, nn.Conv1d)
-            ):
-                nn.init_normal_(m.weight, 0.0, 0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        #for m in self.modules():
+        #    if (
+        #        isinstance(m, nn.Conv2d)
+        #        or isinstance(m, nn.Conv1d)
+        #    ):
+        #        nn.init.normal_(m.weight, 0.0, 0.01)
+        #        if m.bias is not None:
+        #            nn.init.constant_(m.bias, 0)
 
     #组装attender
     def _init_att_convs(self):
@@ -440,10 +448,10 @@ class RefineHead(BaseMaskHead):
     
     def _init_predictor_att(self):
         self.conv_att = nn.Conv2d(
-            32, 1, kernel_size=3, stride=1, padding=1,
+            32, 1, kernel_size=3, stride=1, padding=1, bias=True
         )
-        nn.init.normal_(self.conv_att.weight, 0, 0.01)
-        nn.init.constant_(self.conv_att.bias, 0)
+        #nn.init.normal_(self.conv_att.weight, 0, 0.01)
+        #nn.init.constant_(self.conv_att.bias, 0)
         self.conv_att_activate = nn.Sigmoid()
     """
     to be added:
@@ -462,12 +470,12 @@ class RefineHead(BaseMaskHead):
         self.scale_heads = []
         #self.in_features:  p2,p3,p4,p5
         #对于mmdet来说，input应该是fpn的output,也即x
-        for in_feature in self.in_features:
+        for i, in_feature in enumerate(self.in_features):
             head_ops = []
             head_length = max(
                 1,
                 int(
-                    np.log2(self.strides[in_feature])
+                    np.log2(self.strides[i])
                     - np.log2(self.common_stride)
                 ),
             )
@@ -483,7 +491,7 @@ class RefineHead(BaseMaskHead):
                     act_cfg=dict(type='ReLU')
                 )
                 head_ops.append(conv)
-                if self.strides[in_feature] != self.common_stride:
+                if self.strides[i] != self.common_stride:
                     head_ops.append(
                         nn.Upsample(
                             scale_factor=2, mode="bilinear", align_corners=False
@@ -504,17 +512,18 @@ class RefineHead(BaseMaskHead):
                 padding=1,
                 #bias='auto'
                 norm_cfg=dict(type='GN', num_groups=32),
-                act_cfg=dict(type='ReLU')
             ) 
-        )       
+        )
+        #num_classes = 1      
         self.pred_convs.append(
             ConvModule(
                 self.feat_channels,
-                self.num_classes,
+                1,
                 kernel_size=1,
                 stride=1,
                 padding=0,
                 #bias='auto'
+                act_cfg=None,
             )
         )
 
@@ -655,33 +664,25 @@ class RefineHead(BaseMaskHead):
         return poly[0], edge_start_idx[0]
 
     #pred_instance
-    def sample_bboxes_fast(self, pred_instances):
-        poly_sample_locations = []
-        image_index = []
-        for im_i in range(len(pred_instances)):
-            instance_per_im = pred_instances[im_i]
-            xmin, ymin = (
+    def single_sample_bboxes_fast(self, pred_instances):
+        instance_per_im = pred_instances
+        xmin, ymin = (
             instance_per_im[:, 0],
             instance_per_im[:, 1],
-            )  # (n,)
-            xmax, ymax = (
-                instance_per_im[:, 2],
-                instance_per_im[:, 3],
-            )  # (n,)
-            box = [xmax, ymin, xmin, ymin, xmin, ymax, xmax, ymax]
-            box = torch.stack(box, dim=1).view(-1, 4, 2)
-            sampled_box, _ = self.uniform_upsample(box[None], self.num_sampling)
-            poly_sample_locations.append(sampled_box)
-            image_index.append(box.new_empty(len(box)).fill_(im_i))
-
-        poly_sample_locations = cat(poly_sample_locations, dim=0)
-        image_index = cat(image_index)
-        return poly_sample_locations, image_index
+        )  # (n,)
+        xmax, ymax = (
+            instance_per_im[:, 2],
+            instance_per_im[:, 3],
+        )  # (n,)
+        box = [xmax, ymin, xmin, ymin, xmin, ymax, xmax, ymax]
+        box = torch.stack(box, dim=1).view(-1, 4, 2)
+        sampled_box, _ = self.uniform_upsample(box[None], self.num_sampling)
+        return sampled_box, None
 
     #gt_masks
     @staticmethod
     def get_simple_contour(gt_masks):
-        polygon_mask = gt_masks.masks
+        polygon_mask = gt_masks
         contours = []
 
         for polys in polygon_mask:
@@ -697,18 +698,14 @@ class RefineHead(BaseMaskHead):
 
     #对Polygon类的调用主要在这个方法里面
     #https://github.com/shapely/shapely/blob/main/shapely/geometry/polygon.py
-    """
-    这里需求collect img_metas, 使用img_metas[i]['img_shape']
-    """
     def compute_targets_for_polys(self, gt_bboxes, gt_masks, image_sizes):
         poly_sample_locations = []
         poly_sample_targets = []
-        dense_sample_targets = []  # 3x number of sampling
+        # dense_sample_targets = []  # 3x number of sampling
 
-        init_box_locs = []
-        init_ex_targets = []
+        # init_box_locs = []
+        # init_ex_targets = []
 
-        edge_index = []
         image_index = []
         scales = []
         # cls = []
@@ -721,51 +718,52 @@ class RefineHead(BaseMaskHead):
         #    up_rate = 1
 
         # per image
-        for im_i in range(len(gt_bboxes)):
+        for im_i in range(len(image_sizes)):
             img_size_per_im = image_sizes[im_i]
-            bboxes = gt_bboxes[im_i].tensor
+            bboxes = gt_bboxes[im_i]
             # classes = targets_per_im.gt_classes
 
             # no gt
             if bboxes.numel() == 0:
                 continue
 
-            gt_masks = gt_masks[im_i].tensor
-
+            cur_masks = gt_masks[im_i].masks
             # use this as a scaling
             ws = bboxes[:, 2] - bboxes[:, 0]
             hs = bboxes[:, 3] - bboxes[:, 1]
 
             
-            if (self.initial == "box") and (not self.original):
+                #if (self.initial == "box") and (not self.original):
                 # upper_right = torch.stack([bboxes[:, None, 2], bboxes[:, None, 1]], dim=2)
                 # upper_left = torch.stack([bboxes[:, None, 0], bboxes[:, None, 1]], dim=2)
                 # bottom_left = torch.stack([bboxes[:, None, 0], bboxes[:, None, 3]], dim=2)
                 # bottom_right = torch.stack([bboxes[:, None, 2], bboxes[:, None, 3]], dim=2)
                 # octagons = torch.cat([upper_right, upper_left, bottom_left, bottom_right], dim=1)
                 # print('wrong')
-                xmin, ymin = bboxes[:, 0], bboxes[:, 1]  # (n,)
-                xmax, ymax = bboxes[:, 2], bboxes[:, 3]  # (n,)
-                box = [xmax, ymin, xmin, ymin, xmin, ymax, xmax, ymax]
-                box = torch.stack(box, dim=1).view(-1, 4, 2)
-                octagons, edge_start_idx = self.uniform_upsample(
-                    box[None], self.num_sampling
-                )
+            xmin, ymin = bboxes[:, 0], bboxes[:, 1]  # (n,)
+            xmax, ymax = bboxes[:, 2], bboxes[:, 3]  # (n,)
+            box = [xmax, ymin, xmin, ymin, xmin, ymax, xmax, ymax]
+            box = torch.stack(box, dim=1).view(-1, 4, 2)
+            octagons, _ = self.uniform_upsample(
+                box[None], self.num_sampling
+            )
 
-                # just to suppress errors (DUMMY):
-                init_box, _ = self.uniform_upsample(box[None], 40)
-                ex_pts = init_box
+            # just to suppress errors (DUMMY):
+            init_box, _ = self.uniform_upsample(box[None], 40)
+            ex_pts = init_box
 
             # List[np.array], element shape: (P, 2) OR None
-            contours = self.get_simple_contour(gt_masks)
+            contours = self.get_simple_contour(cur_masks)
 
             # per instance
             # for (oct, cnt, w, h) in zip(octagons, contours, ws, hs):
-            for (oct, cnt, in_box, ex_tar, w, h, s_idx) in zip(
-                octagons, contours, init_box, ex_pts, ws, hs, edge_start_idx
+            for (oct, cnt, in_box, ex_tar, w, h) in zip(
+                octagons, contours, init_box, ex_pts, ws, hs
             ):
                 if cnt is None:
                     continue
+
+                #debug: stack non-empty Tensor
 
                 # used for normalization
                 scale = torch.min(w, h)
@@ -816,27 +814,27 @@ class RefineHead(BaseMaskHead):
                     :: len(cnt)
                 ]
 
-                if self.initial == "box" and self.new_matching:
-                    oct_sampled_targets, aux_ext_idxs = get_aux_extreme_points(
-                        oct_sampled_targets
+                # if self.initial == "box" and self.new_matching:
+                oct_sampled_targets, aux_ext_idxs = get_aux_extreme_points(
+                    oct_sampled_targets
+                )
+                tt_idx = np.argmin(
+                    np.power(oct_sampled_pts - oct_sampled_targets[0], 2).sum(
+                        axis=1
                     )
-                    tt_idx = np.argmin(
-                        np.power(oct_sampled_pts - oct_sampled_targets[0], 2).sum(
-                            axis=1
-                        )
-                    )
-                    oct_sampled_pts = np.roll(oct_sampled_pts, -tt_idx, axis=0)
-                    oct = torch.from_numpy(oct_sampled_pts).to(oct.device)
-                    oct_sampled_targets = self.single_uniform_multisegment_matching(
-                        oct_sampled_targets, oct_sampled_pts, aux_ext_idxs, up_rate
-                    )
-                    oct_sampled_targets = torch.tensor(
-                        oct_sampled_targets, device=bboxes.device
-                    ).float()
-                else:
-                    oct_sampled_targets = torch.tensor(
-                        oct_sampled_targets, device=bboxes.device
-                    )
+                )
+                oct_sampled_pts = np.roll(oct_sampled_pts, -tt_idx, axis=0)
+                oct = torch.from_numpy(oct_sampled_pts).to(oct.device)
+                oct_sampled_targets = self.single_uniform_multisegment_matching(
+                    oct_sampled_targets, oct_sampled_pts, aux_ext_idxs, up_rate
+                )
+                oct_sampled_targets = torch.tensor(
+                    oct_sampled_targets, device=bboxes.device
+                ).float()
+                # else:
+                #    oct_sampled_targets = torch.tensor(
+                #        oct_sampled_targets, device=bboxes.device
+                #    )
                 # assert not Polygon(oct_sampled_targets).exterior.is_ccw, '2) contour must be clock-wise!'
 
                 # oct_sampled_pts = torch.tensor(oct_sampled_pts, device=bboxes.device)
@@ -845,7 +843,7 @@ class RefineHead(BaseMaskHead):
                 oct_sampled_targets[..., 0].clamp_(min=0, max=img_size_per_im[1] - 1)
                 oct_sampled_targets[..., 1].clamp_(min=0, max=img_size_per_im[0] - 1)
 
-                dense_targets = oct_sampled_targets
+                # dense_targets = oct_sampled_targets
 
                 # Jittering should happen after all the matching
                 """if self.jittering:
@@ -864,37 +862,47 @@ class RefineHead(BaseMaskHead):
                     ex_pts[..., 1].clamp_(min=0, max=img_size_per_im[0] - 1)"""
 
                 poly_sample_locations.append(oct)
-                dense_sample_targets.append(dense_targets)
+                # dense_sample_targets.append(dense_targets)
                 poly_sample_targets.append(oct_sampled_targets)
                 image_index.append(im_i)
                 scales.append(scale)
                 whs.append([w, h])
-                init_box_locs.append(in_box)
-                init_ex_targets.append(ex_tar)
+                # init_box_locs.append(in_box)
+                # init_ex_targets.append(ex_tar)
 
-        init_ex_targets = torch.stack(init_ex_targets, dim=0)
-        poly_sample_locations = torch.stack(poly_sample_locations, dim=0)
-        init_box_locs = torch.stack(init_box_locs, dim=0)
         # init_ex_targets = torch.stack(init_ex_targets, dim=0)
-
-        dense_sample_targets = torch.stack(dense_sample_targets, dim=0)
-        poly_sample_targets = torch.stack(poly_sample_targets, dim=0)
+        if len(poly_sample_locations) == 0:
+            print(poly_sample_locations)
+            cur_masks_tensor = torch.tensor(cur_masks * 0).to(bboxes.device)
+            poly_sample_locations = torch.sum(bboxes) * 0
+            poly_sample_targets = torch.sum(cur_masks_tensor) * 0
+            scales = torch.zeros(1).to(bboxes.device)
+            err_flag = True
+            print('Stack expects a non-empty tensor!!')
+        else:
+            poly_sample_locations = torch.stack(poly_sample_locations, dim=0)
+            poly_sample_targets = torch.stack(poly_sample_targets, dim=0)
+            scales = torch.stack(scales, dim=0)
+            err_flag = False
+        # init_box_locs = torch.stack(init_box_locs, dim=0)
+        # init_ex_targets = torch.stack(init_ex_targets, dim=0)
+        # dense_sample_targets = torch.stack(dense_sample_targets, dim=0)
         # edge_index = torch.stack(edge_index, dim=0)
         image_index = torch.tensor(image_index, device=bboxes.device)
         whs = torch.tensor(whs, device=bboxes.device)
-        scales = torch.stack(scales, dim=0)
 
         # cls = torch.stack(cls, dim=0)
         return {
             "sample_locs": poly_sample_locations,
             "sample_targets": poly_sample_targets,
-            "sample_dense_targets": dense_sample_targets,
+            # "sample_dense_targets": dense_sample_targets,
             "scales": scales,
             "whs": whs,
             # "edge_idx": edge_index,
             "image_idx": image_index,
-            "init_locs": init_box_locs,
-            "init_targets": init_ex_targets,
+            "err_flag": err_flag,
+            # "init_locs": init_box_locs,
+            # "init_targets": init_ex_targets,
         }
 
     def single_uniform_multisegment_matching(
@@ -1149,8 +1157,8 @@ class RefineHead(BaseMaskHead):
     @staticmethod
     def clip_locations(pred_locs, image_idx, image_sizes):
         if image_idx is None:
-            pred_locs[0, :, 0::2].clamp_(min=0, max=image_sizes[1] - 1)
-            pred_locs[0, :, 1::2].clamp_(min=0, max=image_sizes[0] - 1)
+            pred_locs[0, :, 0::2].clamp_(min=0, max=image_sizes[0][1] - 1)
+            pred_locs[0, :, 1::2].clamp_(min=0, max=image_sizes[0][0] - 1)
         else:
             for i, img_size_per_im in enumerate(image_sizes):
                 pred_locs[image_idx == i, :, 0::2].clamp_(
@@ -1167,22 +1175,22 @@ class RefineHead(BaseMaskHead):
                 x = self.scale_heads[i](feats[i])
             else:
                 x = x + self.scale_heads[i](feats[i])
-        
-        pred_logits = self.pred_convs(x)
-        pred_edge = pred_logits.sigmoid()
-        #if self.attention:
-        att_temp = self.att_convs(
-            1 - pred_edge
-        )  # regions that need evolution
-        att_map = self.conv_att(att_temp)
-
-        #if self.training:  
-        #if self.strong_feat:
         input_feat = x
-        #if self.attention:
-        #if self.strong_feat:
+        #convolution for nn.ModuleList
+        #generate predictions
+        for pred_layer in (self.pred_convs):
+            x = pred_layer(x)
+        pred_edge = x.sigmoid()
+        #attentnion procedure
+        att_temp = 1 - pred_edge
+        #att_temp = 1 - x
+        for att_layer in (self.att_convs):
+            att_temp = att_layer(att_temp)  # regions that need evolution
+        att_map = self.conv_att(att_temp)
+        att_map_acted = self.conv_att_activate(att_map)
+
         #Snake_head input features
-        snake_input = torch.cat([att_map, input_feat], dim=1)
+        snake_input = torch.cat([att_map_acted, input_feat], dim=1)
 
         #if self.edge_on:
         seg_preds = F.interpolate(
@@ -1211,92 +1219,114 @@ class RefineHead(BaseMaskHead):
         #return pred_edge, {}, new_instances    
     
     #@force_fp32(apply_to=('seg_preds', ))
-    def loss(self, features, seg_preds, gt_bboxes, gt_masks, gt_semantic_seg, img_metas):
+    def loss(self, features, seg_preds, gt_bboxes, gt_masks, gt_semantic_seg, img_metas, **kwargs):
         loss = {}
         location_preds = []
-        image_sizes = img_metas['img_shape']
-        training_targets = self.compute_targets_for_polys(gt_bboxes, gt_masks)
+        image_sizes = []
+        for im_i in range(len(img_metas)):
+            image_sizes.append(img_metas[im_i]['img_shape'][:2])
+        training_targets = self.compute_targets_for_polys(gt_bboxes, gt_masks, image_sizes)
 
-        locations, reg_targets, scales, image_idx, whs = (
+        locations, reg_targets, scales, image_idx, whs, err_flag = (
             training_targets["sample_locs"],
             training_targets["sample_targets"],
             training_targets["scales"],
             training_targets["image_idx"],
             training_targets["whs"],
+            training_targets["err_flag"]
             )
-        for i in range(len(self.num_iter)):
-            deformer = self.__getattr__("deformer" + str(i))
-            if i == 0:
-                pred_location = self.evolve(
-                    deformer,
-                    features,
-                    locations,
-                    image_idx,
-                    image_sizes,
-                    whs,
-                )
-            else:
-                pred_location = self.evolve(
-                    deformer,
-                    features,
-                    pred_location,
-                    image_idx,
-                    image_sizes,
-                    whs,
-                    att=True,
-                )
-            location_preds.append(pred_location)
-        for i, (pred) in enumerate(location_preds):
-            loss_name = "loss_stage_" + str(i)
-            stage_weight = 1 / 3
-            #if not self.loss_adaptive:
-            dynamic_reg_targets = reg_targets
-
-            #if not self.point_loss_weight:
-            #point_weight = (
-            #    torch.tensor(1, device=scales.device).float()
-            #    / scales[:, None, None]
-            #)
-            #if self.individual_scale:
-            #相当于进行一个分别的归一化
-            point_weight = (
-                torch.tensor(1, device=scales.device).float()
-                / whs[:, None, :]
-            )
-
-            stage_loss = (
-                self.loss_refine(
-                    pred * point_weight, dynamic_reg_targets * point_weight
-                )
-                * stage_weight
-            )
-
-            loss[loss_name] = stage_loss * (1 / 3)
+        # location = ([])
+        #vis(image, locations, reg_targets)
         edge_loss = self.loss_edge(seg_preds, gt_semantic_seg)
+        if err_flag:
+            loss["loss_stage_0"] = (torch.sum(features) * 0).to(device=edge_loss.device)
+            loss["loss_stage_1"] = locations.to(device=edge_loss.device)
+            loss["loss_stage_2"] = reg_targets.to(device=edge_loss.device)
+            print(loss)
+        else:
+            for i in range(len(self.num_iter)):
+                deformer = self.__getattr__("deformer" + str(i))
+                if i == 0:
+                    pred_location = self.evolve(
+                        deformer,
+                        features,
+                        locations,
+                        image_idx,
+                        image_sizes,
+                        whs,
+                    )
+                else:
+                    pred_location = self.evolve(
+                        deformer,
+                        features,
+                        pred_location,
+                        image_idx,
+                        image_sizes,
+                        whs,
+                        att=True,
+                    )
+                #vis(image, pred_location.detach(), reg_targets)
+                location_preds.append(pred_location)
+            for i, (pred) in enumerate(location_preds):
+                loss_name = "loss_stage_" + str(i)
+                stage_weight = 1 / 3
+                #if not self.loss_adaptive:
+                #dynamic_reg_targets = reg_targets
+
+                #if not self.point_loss_weight:
+                #point_weight = (
+                #    torch.tensor(1, device=scales.device).float()
+                #    / scales[:, None, None]
+                #)
+                #if self.individual_scale:
+                #相当于进行一个分别的归一化
+                #test 不做归一化
+                point_weight = (
+                    torch.tensor(1, device=scales.device).float()
+                    / whs[:, None, :]
+                )
+
+                stage_loss = (
+                    self.loss_refine(
+                        pred * point_weight, reg_targets * point_weight
+                    )
+                    #self.loss_refine(
+                    #    pred, reg_targets
+                    #)
+                    * stage_weight
+                )
+
+                loss[loss_name] = stage_loss
         loss.update(dict(loss_edge = edge_loss))
         return loss
 
     def get_results(self, features, proposals, img_metas):
         location_preds = []
-        locations, image_idx = self.sample_bboxes_fast(proposals)
+        locations, image_idx = self.single_sample_bboxes_fast(proposals)
 
         if len(locations) == 0:
             return proposals
-
-        image_sizes = img_metas['img_shape']
+        image_sizes = []
+        image_sizes_ori = []
+        scale_factors = []
+        for im_i in range(len(img_metas)):
+            image_sizes.append(img_metas[im_i]['img_shape'][:2])
+            image_sizes_ori.append(img_metas[im_i]['ori_shape'][:2])
+            #warning: can scale factor be diffierent in some occasions?
+            scale_factors.append(img_metas[im_i]['scale_factor'][:2])
         #img_shape: (h, w, 3)
         # print(image_sizes)
         # print(features.shape)
         # bboxes = pred_instances[0].pred_boxes.tensor
         # print(bboxes.max(0)[0], bboxes.min(0)[0])
-        bboxes = proposals.tensor
+        # bboxes = proposals
         #if unecessary?
-        bboxes = cat(bboxes, dim=0)
+        bboxes = proposals
 
         ws = bboxes[:, 2] - bboxes[:, 0]
         hs = bboxes[:, 3] - bboxes[:, 1]
         whs = torch.stack([ws, hs], dim=1)
-
+        #vis(img, locations, locations, img_metas)
         for i in range(len(self.num_iter)):
             deformer = self.__getattr__("deformer" + str(i))
             if i == 0:
@@ -1313,24 +1343,34 @@ class RefineHead(BaseMaskHead):
                     whs,
                     att=True,
                 )
+            #vis(img, pred_location, pred_location, img_metas)
             location_preds.append(pred_location)
 
-        return self._location_postprocess(location_preds, proposals, image_idx, image_sizes)
+        return self._location_postprocess(location_preds, proposals, image_idx, image_sizes_ori, scale_factors)
     
     def _location_postprocess(
-        location_preds, proposals, image_idx, image_sizes
+        self, location_preds, proposals, image_idx, image_sizes, scale_factors
     ):
+        results = []
         if image_idx is None:
             pred_per_im = location_preds[-1]
+            pred_per_im /= pred_per_im.new_tensor(scale_factors)
             det_polys = PolygonPoints(pred_per_im)
-            return det_polys
+            cur_size = image_sizes[0]
+            output_height = cur_size[0]
+            output_width = cur_size[1]
+            #image_size_ori : [h, w]
+            det_rles = get_polygon_rles(
+                det_polys.flatten(), (output_height, output_width)
+            )
+            return det_rles
 
-        results = []
         # per im
         #change it into coco evaluator format
         for i, _ in enumerate(proposals):
             pred_per_im = location_preds[-1][image_idx == i]  # N x 128 x 2
             det_polys = PolygonPoints(pred_per_im)
+            #try image size
             cur_size = image_sizes[image_idx == i]
             output_height = cur_size[0]
             output_width = cur_size[1]
@@ -1378,10 +1418,10 @@ class RefineHead(BaseMaskHead):
             outs = self(x, positive_infos)
 
         loss = self.loss(
-            *outs,
+            outs,
             seg_preds,
-            gt_masks=gt_masks,
             gt_bboxes=gt_bboxes,
+            gt_masks=gt_masks,
             gt_semantic_seg=gt_semantic_seg,
             img_metas=img_metas,
             gt_bboxes_ignore=gt_bboxes_ignore,
@@ -1426,3 +1466,36 @@ class RefineHead(BaseMaskHead):
             img_metas,
             **kwargs)
         return results_list
+
+"""def vis(image, poly_sample_locations, poly_sample_targets):
+    import matplotlib.pyplot as plt
+
+    w = image.shape[2]
+    h = image.shape[3]
+    image_vis = image.reshape(-1, w, h)
+    image_vis = image_vis.cpu().numpy().transpose(1, 2, 0)[:, :, ::-1].astype(np.uint8)
+    #image_vis = image_vis.cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
+    poly_sample_locations = poly_sample_locations.cpu().numpy()
+    poly_sample_targets = poly_sample_targets.cpu().numpy()
+    colors = (
+        np.array([[1, 1, 198], [51, 1, 148], [101, 1, 98], [151, 1, 48], [201, 1, 8]])
+        / 255.0
+    )
+
+    fig, ax = plt.subplots(1, figsize=(20, 10))
+    fig.tight_layout()
+
+    ax.imshow(image_vis)
+
+    for i, (loc, target) in enumerate(zip(poly_sample_locations, poly_sample_targets)):
+        offsets = target - loc
+        for j in range(len(loc)):
+            if j == 0:
+                ax.text(loc[:1, 0], loc[:1, 1], str(i))
+            ax.arrow(loc[j, 0], loc[j, 1], offsets[j, 0], offsets[j, 1])
+
+        ax.plot(loc[0:, 0], loc[0:, 1], color="g", marker="1")
+        ax.plot(target[0:, 0], target[0:, 1], marker="1", color=colors[i % 5].tolist())
+
+    plt.show()
+    fig.savefig("/home/sjtu/scratch/shaoyinkang/dance_mmdetection/tmp.jpg", bbox_inches="tight", pad_inches=0)"""

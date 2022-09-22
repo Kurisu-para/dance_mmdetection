@@ -234,13 +234,14 @@ class FCOSDanceHead(AnchorFreeHead):
         #only included in training
         #norm_on_bbox: False
         #warning: it may cause bug
-        if self.training:
-            extremeness = self.conv_ext(reg_feat)
-            extremeness = torch.tanh(extremeness)
+        # if self.training:
+        extremeness = self.conv_ext(reg_feat)
+        extremeness = torch.tanh(extremeness)
 
         # scale the bbox_pred of different level
         # float to avoid overflow when enabling FP16
         bbox_pred = scale(bbox_pred).float()
+        #extremeness = scale(extremeness).float()
         if self.norm_on_bbox:
             # bbox_pred needed for gradient computation has been modified
             # by F.relu(bbox_pred) when run with PyTorch 1.10. So replace
@@ -442,8 +443,8 @@ class FCOSDanceHead(AnchorFreeHead):
             bbox_targets = torch.cat(
                 [bbox_targets[i] for bbox_targets in bbox_targets_list])
             #they normalize bbox_targets by FPN's strides here in dance
-            #if self.norm_on_bbox:
-            bbox_targets = bbox_targets / self.strides[i]
+            if self.norm_on_bbox:
+                bbox_targets = bbox_targets / self.strides[i]
             concat_lvl_bbox_targets.append(bbox_targets)
             ext_targets = torch.cat(
                 [ext_targets[i] for ext_targets in ext_targets_list])
@@ -485,13 +486,14 @@ class FCOSDanceHead(AnchorFreeHead):
         #about ext targets
         #warning: gt_masks.polygons can be a false parameter
         #ext_pts = get_simple_extreme_points(gt_masks.polygons).to(gt_bboxes.device)
-        ext_pts = get_simple_extreme_points(gt_masks.masks).to(gt_bboxes.device)
-        t_H = (ext_pts[:, 0][None] - xs[:, None]) / w
-        l_V = (ext_pts[:, 1][None] - ys[:, None]) / h
-        b_H = (ext_pts[:, 2][None] - xs[:, None]) / w
-        r_V = (ext_pts[:, 3][None] - ys[:, None]) / h
+        cur_masks = gt_masks.masks
+        ext_pts = get_simple_extreme_points(cur_masks).to(gt_bboxes.device)
+        t_H = (ext_pts[:, 0] - xs) / w
+        l_V = (ext_pts[:, 1] - ys) / h
+        b_H = (ext_pts[:, 2] - xs) / w
+        r_V = (ext_pts[:, 3] - ys) / h
 
-        ext_targets = torch.stack([t_H, l_V, b_H, r_V], -1)
+        ext_targets = torch.stack((t_H, l_V, b_H, r_V), -1)
 
         if self.center_sampling:
             # condition1: inside a `center bbox`
@@ -550,6 +552,7 @@ class FCOSDanceHead(AnchorFreeHead):
         ext_targets = ext_targets[range(num_points), min_area_inds]
 
         return labels, bbox_targets, ext_targets
+        #return labels, bbox_targets, bbox_targets
 
     def centerness_target(self, pos_bbox_targets):
         """Compute centerness targets.
@@ -593,3 +596,26 @@ class FCOSDanceHead(AnchorFreeHead):
                              dim=-1) + stride // 2
         return points
     
+    def simple_test_bboxes(self, feats, img_metas, rescale=False):
+        """Test det bboxes without test-time augmentation, can be applied in
+        DenseHead except for ``RPNHead`` and its variants, e.g., ``GARPNHead``,
+        etc.
+
+        Args:
+            feats (tuple[torch.Tensor]): Multi-level features from the
+                upstream network, each is a 4D-tensor.
+            img_metas (list[dict]): List of image information.
+            rescale (bool, optional): Whether to rescale the results.
+                Defaults to False.
+
+        Returns:
+            list[tuple[Tensor, Tensor]]: Each item in result_list is 2-tuple.
+                The first item is ``bboxes`` with shape (n, 5),
+                where 5 represent (tl_x, tl_y, br_x, br_y, score).
+                The shape of the second tensor in the tuple is ``labels``
+                with shape (n,)
+        """
+        cls_scores, bbox_preds, centernesses, _ = self.forward(feats)
+        results_list = self.get_bboxes(
+            cls_scores, bbox_preds, centernesses, img_metas=img_metas, rescale=rescale)
+        return results_list

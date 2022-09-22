@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import torch
+import numpy as np
 from mmdet.core import bbox2result
 
 from ..builder import DETECTORS
@@ -54,22 +55,39 @@ class Dance(SingleStageInstanceSegmentor):
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
         """
-        gt_masks = [
-            gt_mask.to_tensor(dtype=torch.bool, device=img.device)
-            for gt_mask in gt_masks
-        ]
+        #gt_masks = [
+        #    gt_mask.to_tensor(dtype=torch.bool, device=img.device)
+        #    for gt_mask in gt_masks
+        #]
         x = self.extract_feat(img)
         #这里的features层次选择，应该把参数加到什么地方比较合理？
         x_fcos = x[1:]
         x_edge = x[:4]
         losses = dict()
-        losses_fcos = self.bbox_head.forward_train(x_fcos, img_metas, gt_bboxes,
-                                              gt_labels, gt_bboxes_ignore)
-        losses_edge = self.mask_head.forward_train(x_edge, gt_bboxes, gt_masks,
-                                              gt_semantic_seg, img_metas, gt_bboxes_ignore, positive_infos)
+        bbox_head_preds = self.bbox_head(x_fcos)
+        losses_fcos = self.bbox_head.loss(
+                *bbox_head_preds,
+                gt_bboxes=gt_bboxes,
+                gt_labels=gt_labels,
+                gt_masks=gt_masks,
+                img_metas=img_metas,
+                gt_bboxes_ignore=gt_bboxes_ignore)
+        #Some annotations can generate an empty TensorList sampled targets.
+        losses.update(losses_fcos)
         #用mask_head表示edge部分
-        losses.update(losses_fcos)                                      
-        losses.update(losses_edge)                                    
+        losses_edge = self.mask_head.forward_train(x_edge, gt_bboxes, gt_masks,
+                                            gt_semantic_seg, img_metas,gt_bboxes_ignore, positive_infos)
+        losses.update(losses_edge)
+        #用mask_head表示edge部分                                      
+        #except RuntimeError:
+        #    print("a non-empty poly_sample_location tensor is ignored here!")
+        #    #just simply update losses_fcos again to make the length of loss the same as correct one
+        #    losses_test = {}
+        #    losses_test["loss_stage_0"] = losses_fcos['loss_cls']
+        #    losses_test["loss_stage_1"] = losses_fcos['loss_bbox']
+        #    losses_test["loss_stage_2"] = losses_fcos['loss_centerness']
+        #    losses_test["loss_edge"] = losses_fcos['loss_ext']
+        #    losses.update(losses_test)
         return losses
 
     def simple_test(self, img, img_metas, rescale=False):
@@ -87,20 +105,50 @@ class Dance(SingleStageInstanceSegmentor):
         feat = self.extract_feat(img)
         feat_fcos = feat[1:]
         feat_edge = feat[:4]
-        det_bboxes, det_labels = self.bbox_head.simple_test(
+        result_list = self.bbox_head.simple_test(
             feat_fcos, img_metas, rescale=rescale)
         bbox_results = [
-            bbox2result(det_bbox, det_label, self.bbox_head.num_classes)
-            for det_bbox, det_label in zip(det_bboxes, det_labels)
+            bbox2result(det_bboxes, det_labels, self.bbox_head.num_classes)
+            for det_bboxes, det_labels in result_list
         ]
+        #in test, batch_size = 1
+        if len(result_list) == 1:
+            #no need scores
+            mask_pre = result_list[0][0]
+            det_bboxes_mask_pre = mask_pre[:,:4]
+            det_bboxes_mask = det_bboxes_mask_pre * det_bboxes_mask_pre.new_tensor(img_metas[0]['scale_factor'])
+        else:
+            det_bboxes_mask = [torch.cat(det_bboxes) for det_bboxes, _ in result_list]
+        #it is not a good idea to adjust test batch size
+        poly_list = self.mask_head.simple_test(feat_edge, det_bboxes_mask, img_metas)
+        #poly_results_list = []
+        #for poly in poly_list:
+        #poly_results_list.append()
+        poly_results = [self.format_poly_results(poly_list, det_labels, self.bbox_head.num_classes)
+                        for _, det_labels in result_list]
+        format_results_list = []
+        for bbox_result, poly_result in zip(bbox_results, poly_results):
+            format_results_list.append((bbox_result, poly_result))
 
-        poly_results = self.mask_head.simple_test(feat_edge, det_bboxes, img_metas)
-        return list(zip(bbox_results, poly_results))
+        return format_results_list
         # bbox_results = [
         #    bbox2result(det_bboxes, det_labels, self.bbox_head.num_classes)
         #    for det_bboxes, det_labels in results_list
         #]
         # return bbox_results
+    
+    def format_poly_results(self, masks, labels, num_classes):
+        num_masks = len(masks)
+        mask_results = [[] for _ in range(num_classes)]
+        if num_masks == 0:
+            return mask_results
+        else:
+            labels = labels.detach().cpu().numpy()
+            for idx in range(num_masks):
+                mask = masks[idx]
+                mask_results[labels[idx]].append(mask)
+            return mask_results
+
 
     def aug_test(self, imgs, img_metas, rescale=False):
         """Test function with test time augmentation.
