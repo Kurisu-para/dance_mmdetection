@@ -214,8 +214,8 @@ def get_aux_extreme_points(pts):
 
     return re_ordered_pts, ext_idxs
 
-#In fact, batch size is only set as 1 in test, so
-#get_
+#In fact, batch size is only set as 1 in test
+#transform the masks into bitmapmasks, which fit the evaluation procedure
 def get_polygon_rles(polygons, image_shape):
     # input: N x (p*2)
     polygons = polygons.cpu().numpy()
@@ -343,7 +343,7 @@ class RefineHead(BaseMaskHead):
         common_stride=4,
         loss_refine=dict(
                     type='SmoothL1Loss', loss_weight=10.0),
-        loss_edge=dict(type='DiceIgnoreLoss', use_sigmoid = True, loss_weight=1.0),
+        loss_edge=dict(type='DiceIgnoreLoss', use_sigmoid = False, activate = False, loss_weight=1.0),
         norm_cfg=dict(type='GN', num_groups=32, requires_grad=True),
         train_cfg=None,
         test_cfg=None,
@@ -361,14 +361,12 @@ class RefineHead(BaseMaskHead):
         self.state_dim = state_dim   #128
         self.feat_channels = feat_channels   #256
         self.strides = strides
-        self.num_iter = num_iter   #(0, 0, 1)  correspond to the convs
+        self.num_iter = num_iter   #(0, 0, 1)  correspond to the convs.  It seems the value in it is not important at all//
         self.num_convs = num_convs   #2
         self.num_sampling = num_sampling   #196
         # number of FPN feats
         self.num_levels = len(strides)
         self.loss_refine = build_loss(loss_refine)
-        #原文中使用了mask，而在这里没有使用mask，且eps的形式也有所不同
-        #mask为255
         self.loss_edge = build_loss(loss_edge)
         self.norm_cfg = norm_cfg
         self.init_cfg = init_cfg
@@ -384,9 +382,9 @@ class RefineHead(BaseMaskHead):
         self._init_edge_convs()
         self._init_snake_convs()
     
+    #snake_conv == bottom_out
     def _init_snake_convs(self):
         self.snake_conv = nn.ModuleList()
-        #snake_conv == bottom_out
         for i in range(self.num_convs):
             self.snake_conv.append(
                 ConvModule(
@@ -453,17 +451,7 @@ class RefineHead(BaseMaskHead):
         #nn.init.normal_(self.conv_att.weight, 0, 0.01)
         #nn.init.constant_(self.conv_att.bias, 0)
         self.conv_att_activate = nn.Sigmoid()
-    """
-    to be added:
-    init_cfg=dict(
-        ...
-        override = dict(
-            type = 'Constant'
-            name = 'conv_att',
-            bias_prob = 0)
-    )
-    init方式比较复杂,直接放在该部分中
-    """
+
     #组装 edge_predictor  
     def _init_edge_convs(self):
         #if self.edge_on
@@ -501,7 +489,6 @@ class RefineHead(BaseMaskHead):
             self.add_module(in_feature, self.scale_heads[-1])
 
         #对应predictor
-        #if self.strong_feat
         self.pred_convs = nn.ModuleList()
         self.pred_convs.append(
             ConvModule(
@@ -514,7 +501,7 @@ class RefineHead(BaseMaskHead):
                 norm_cfg=dict(type='GN', num_groups=32),
             ) 
         )
-        #num_classes = 1      
+        #num_classes = 1   class agnostic   
         self.pred_convs.append(
             ConvModule(
                 self.feat_channels,
@@ -679,7 +666,6 @@ class RefineHead(BaseMaskHead):
         sampled_box, _ = self.uniform_upsample(box[None], self.num_sampling)
         return sampled_box, None
 
-    #gt_masks
     @staticmethod
     def get_simple_contour(gt_masks):
         polygon_mask = gt_masks
@@ -702,14 +688,11 @@ class RefineHead(BaseMaskHead):
         poly_sample_locations = []
         poly_sample_targets = []
         # dense_sample_targets = []  # 3x number of sampling
-
         # init_box_locs = []
         # init_ex_targets = []
-
         image_index = []
-        scales = []
+        # scales = []
         # cls = []
-
         whs = []
 
         #if self.new_matching:
@@ -730,9 +713,7 @@ class RefineHead(BaseMaskHead):
             cur_masks = gt_masks[im_i].masks
             # use this as a scaling
             ws = bboxes[:, 2] - bboxes[:, 0]
-            hs = bboxes[:, 3] - bboxes[:, 1]
-
-            
+            hs = bboxes[:, 3] - bboxes[:, 1]            
                 #if (self.initial == "box") and (not self.original):
                 # upper_right = torch.stack([bboxes[:, None, 2], bboxes[:, None, 1]], dim=2)
                 # upper_left = torch.stack([bboxes[:, None, 0], bboxes[:, None, 1]], dim=2)
@@ -744,29 +725,30 @@ class RefineHead(BaseMaskHead):
             xmax, ymax = bboxes[:, 2], bboxes[:, 3]  # (n,)
             box = [xmax, ymin, xmin, ymin, xmin, ymax, xmax, ymax]
             box = torch.stack(box, dim=1).view(-1, 4, 2)
+            # uniformly sample on the box contour, set points based on the length of edge
             octagons, _ = self.uniform_upsample(
                 box[None], self.num_sampling
             )
 
             # just to suppress errors (DUMMY):
             init_box, _ = self.uniform_upsample(box[None], 40)
-            ex_pts = init_box
+            # ex_pts = init_box
 
             # List[np.array], element shape: (P, 2) OR None
+            # change the mask form into (x,y) coordinate. Note that if instance is fragmented, it will be ignored.
             contours = self.get_simple_contour(cur_masks)
 
             # per instance
             # for (oct, cnt, w, h) in zip(octagons, contours, ws, hs):
-            for (oct, cnt, in_box, ex_tar, w, h) in zip(
-                octagons, contours, init_box, ex_pts, ws, hs
+            for (oct, cnt, in_box, w, h) in zip(
+                octagons, contours, init_box, ws, hs
             ):
                 if cnt is None:
                     continue
 
-                #debug: stack non-empty Tensor
-
+                # debug: stack non-empty Tensor
                 # used for normalization
-                scale = torch.min(w, h)
+                # scale = torch.min(w, h)
 
                 # make it clock-wise
                 cnt = cnt[::-1] if Polygon(cnt).exterior.is_ccw else cnt
@@ -780,11 +762,6 @@ class RefineHead(BaseMaskHead):
                     cnt
                 ).exterior.is_ccw, "1) contour must be clock-wise!"
 
-                # sampling from octagon
-                # oct_sampled_pts = self.uniform_sample(oct, self.num_sampling)
-                #
-                # oct_sampled_pts = oct_sampled_pts[::-1].copy() if Polygon(
-                #     oct_sampled_pts).exterior.is_ccw else oct_sampled_pts
                 oct_sampled_pts = oct.cpu().numpy()
                 assert not Polygon(
                     oct_sampled_pts
@@ -795,24 +772,19 @@ class RefineHead(BaseMaskHead):
                     to_check
                 ).exterior.is_ccw, "0) init box must be clock-wise!"
 
-                # if self.initial == 'box':
-                #
-                #     first_pt = aux_oct[0].cpu().numpy()
-                #     tt_idx = np.argmin(np.power(oct_sampled_pts - first_pt, 2).sum(axis=1))
-                #
-
                 # sampling from ground truth
+                # sample from contour(gt masks)
                 oct_sampled_targets = self.uniform_sample(
                     cnt, len(cnt) * self.num_sampling * up_rate
                 )  # (big, 2)
                 # oct_sampled_targets = self.uniform_sample(cnt, len(cnt) * self.num_sampling * up_sample_rate)
                 # i) find a single nearest, so that becomes ordered point sets
-                tt_idx = np.argmin(
-                    np.power(oct_sampled_targets - oct_sampled_pts[0], 2).sum(axis=1)
-                )
-                oct_sampled_targets = np.roll(oct_sampled_targets, -tt_idx, axis=0)[
-                    :: len(cnt)
-                ]
+                # tt_idx = np.argmin(
+                #     np.power(oct_sampled_targets - oct_sampled_pts[0], 2).sum(axis=1)
+                # )
+                # oct_sampled_targets = np.roll(oct_sampled_targets, -tt_idx, axis=0)[
+                #     :: len(cnt)
+                # ]
 
                 # if self.initial == "box" and self.new_matching:
                 oct_sampled_targets, aux_ext_idxs = get_aux_extreme_points(
@@ -865,7 +837,7 @@ class RefineHead(BaseMaskHead):
                 # dense_sample_targets.append(dense_targets)
                 poly_sample_targets.append(oct_sampled_targets)
                 image_index.append(im_i)
-                scales.append(scale)
+                # scales.append(scale)
                 whs.append([w, h])
                 # init_box_locs.append(in_box)
                 # init_ex_targets.append(ex_tar)
@@ -876,13 +848,13 @@ class RefineHead(BaseMaskHead):
             cur_masks_tensor = torch.tensor(cur_masks * 0).to(bboxes.device)
             poly_sample_locations = torch.sum(bboxes) * 0
             poly_sample_targets = torch.sum(cur_masks_tensor) * 0
-            scales = torch.zeros(1).to(bboxes.device)
+            # scales = torch.zeros(1).to(bboxes.device)
             err_flag = True
             print('Stack expects a non-empty tensor!!')
         else:
             poly_sample_locations = torch.stack(poly_sample_locations, dim=0)
             poly_sample_targets = torch.stack(poly_sample_targets, dim=0)
-            scales = torch.stack(scales, dim=0)
+            # scales = torch.stack(scales, dim=0)
             err_flag = False
         # init_box_locs = torch.stack(init_box_locs, dim=0)
         # init_ex_targets = torch.stack(init_ex_targets, dim=0)
@@ -896,7 +868,7 @@ class RefineHead(BaseMaskHead):
             "sample_locs": poly_sample_locations,
             "sample_targets": poly_sample_targets,
             # "sample_dense_targets": dense_sample_targets,
-            "scales": scales,
+            # "scales": scales,
             "whs": whs,
             # "edge_idx": edge_index,
             "image_idx": image_index,
@@ -1189,10 +1161,9 @@ class RefineHead(BaseMaskHead):
         att_map = self.conv_att(att_temp)
         att_map_acted = self.conv_att_activate(att_map)
 
-        #Snake_head input features
+        #Snake head input features
         snake_input = torch.cat([att_map_acted, input_feat], dim=1)
 
-        #if self.edge_on:
         seg_preds = F.interpolate(
             pred_edge,
             scale_factor=self.common_stride,
@@ -1209,9 +1180,6 @@ class RefineHead(BaseMaskHead):
         #if self.attention:
         features = torch.cat([edge_band, features], dim=1)
         #pred_instances即box_list
-        
-        """new_instances, poly_loss = self.refine_head(snake_input, pred_instances, targets[1])"""
-        #pred_edge = att_map
 
         return seg_preds, features
         
@@ -1227,10 +1195,9 @@ class RefineHead(BaseMaskHead):
             image_sizes.append(img_metas[im_i]['img_shape'][:2])
         training_targets = self.compute_targets_for_polys(gt_bboxes, gt_masks, image_sizes)
 
-        locations, reg_targets, scales, image_idx, whs, err_flag = (
+        locations, reg_targets, image_idx, whs, err_flag = (
             training_targets["sample_locs"],
             training_targets["sample_targets"],
-            training_targets["scales"],
             training_targets["image_idx"],
             training_targets["whs"],
             training_targets["err_flag"]
@@ -1282,7 +1249,7 @@ class RefineHead(BaseMaskHead):
                 #相当于进行一个分别的归一化
                 #test 不做归一化
                 point_weight = (
-                    torch.tensor(1, device=scales.device).float()
+                    torch.tensor(1, device=whs.device).float()
                     / whs[:, None, :]
                 )
 

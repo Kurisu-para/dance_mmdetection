@@ -77,7 +77,7 @@ def dice_ignore_loss(pred,
 
     dice_coef = (2 * a) / (b + c + eps)
     loss = (1.0 - dice_coef).sum()
-    loss /= target.size(0)
+    loss = loss / target.size(0) 
     if weight is not None:
         assert weight.ndim == loss.ndim
         assert len(weight) == len(pred)
@@ -242,8 +242,9 @@ class DiceIgnoreLoss(nn.Module):
         if self.activate:
             if self.use_sigmoid:
                 pred = pred.sigmoid()
+            #sigomid has used before, no need to use it here
             else:
-                raise NotImplementedError
+                pred = pred
         
         if self.ignore_value:
             mask = torch.ne(target, self.ignore_value).float()

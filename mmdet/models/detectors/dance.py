@@ -113,7 +113,7 @@ class Dance(SingleStageInstanceSegmentor):
         ]
         #in test, batch_size = 1
         if len(result_list) == 1:
-            #no need scores
+            #no need for scores
             mask_pre = result_list[0][0]
             det_bboxes_mask_pre = mask_pre[:,:4]
             det_bboxes_mask = det_bboxes_mask_pre * det_bboxes_mask_pre.new_tensor(img_metas[0]['scale_factor'])

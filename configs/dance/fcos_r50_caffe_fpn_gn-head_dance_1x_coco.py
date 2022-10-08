@@ -63,7 +63,7 @@ model = dict(
         common_stride=4,
         loss_refine=dict(
                     type='SmoothL1Loss', loss_weight=10.0),
-        loss_edge=dict(type='DiceIgnoreLoss', use_sigmoid = True, loss_weight=1.0),
+        loss_edge=dict(type='DiceIgnoreLoss', use_sigmoid = True, activate = False, loss_weight=1.0),
         norm_cfg=dict(type='GN', num_groups=32, requires_grad=True),
     ),
     # training and testing settings
@@ -81,7 +81,7 @@ model = dict(
         nms_pre=1000,
         min_bbox_size=0,
         score_thr=0.05,
-        nms=dict(type='nms', iou_threshold=0.5),
+        nms=dict(type='nms', iou_threshold=0.6),
         max_per_img=100)
     )
 img_norm_cfg = dict(
@@ -142,16 +142,18 @@ data = dict(
             pipeline=test_pipeline))
 evaluation = dict(interval=1, metric=['bbox', 'segm'])
 # optimizer
-optimizer = dict(
-    lr=0.01, paramwise_cfg=dict(bias_lr_mult=2., bias_decay_mult=0.))
+#optimizer = dict(
+#    lr=0.01, paramwise_cfg=dict(bias_lr_mult=2., bias_decay_mult=0.))
+optimizer = dict(type='SGD', lr=0.005, momentum=0.9, weight_decay=0.0001)
 optimizer_config = dict(
     _delete_=True, grad_clip=dict(max_norm=35, norm_type=2))
 # learning policy
+# here we use the same policy as dance in detectron2
 lr_config = dict(
     policy='step',
-    warmup='constant',
-    warmup_iters=500,
-    warmup_ratio=1.0 / 3,
+    warmup='linear',
+    warmup_iters=1000,
+    warmup_ratio=1.0 / 1000,
     step=[8, 11])
 runner = dict(type='EpochBasedRunner', max_epochs=12)
 find_unused_parameters=True
